@@ -26,6 +26,7 @@ from utils.logger import logger
 from uuid import uuid4
 import json
 import asyncio
+from weakref import WeakValueDictionary
 
 
 class KnowledgeGraph:
@@ -49,8 +50,21 @@ class KnowledgeGraph:
     BATCH_SIZE = 25
     MAX_TOKENS = 4000  # Higher limit for JSON output
 
+    # Per-project build locks — prevents concurrent /build calls racing each other
+    _build_locks: WeakValueDictionary = WeakValueDictionary()
+    _locks_meta_lock = asyncio.Lock()
+
     def __init__(self):
         self.client = get_supabase_client()
+
+    async def _get_project_lock(self, project_id: str) -> asyncio.Lock:
+        """Return (creating if needed) a per-project asyncio.Lock."""
+        async with self._locks_meta_lock:
+            lock = self._build_locks.get(project_id)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._build_locks[project_id] = lock
+            return lock
 
     # ============== Graph Building ==============
 
@@ -60,80 +74,99 @@ class KnowledgeGraph:
         """
         Build knowledge graph from document topics using LLM.
 
-        Handles large topic sets by processing in batches.
+        Thread-safe: uses a per-project asyncio.Lock so concurrent requests
+        for the same project queue up instead of racing and producing duplicates.
         """
+        # ── Acquire per-project lock ──────────────────────────────────────────
+        project_lock = await self._get_project_lock(project_id)
+        if project_lock.locked():
+            logger.info(
+                f"[KnowledgeGraph] Build already in progress for {project_id}, skipping."
+            )
+            return {"edges_created": 0, "message": "Build already in progress"}
+
+        async with project_lock:
+            return await self._build_graph_locked(project_id, topics, force_rebuild)
+
+    async def _build_graph_locked(
+        self, project_id: str, topics: List[str], force_rebuild: bool
+    ) -> Dict[str, Any]:
+        """Inner build — runs while the per-project lock is held."""
         try:
             if not topics or len(topics) < 2:
                 return {"edges_created": 0, "message": "Need at least 2 topics"}
 
-            # Check if graph already exists
             if not force_rebuild:
-                existing = await async_db(lambda: 
+                # Re-check inside lock — another request may have built it already
+                existing = await async_db(lambda:
                     self.client.table("topic_relations")
                     .select("id")
                     .eq("project_id", project_id)
                     .limit(1)
                     .execute()
                 )
-
                 if existing.data:
                     return {
                         "edges_created": 0,
                         "message": "Graph already exists. Use force_rebuild=True to rebuild.",
                     }
             else:
-                # Delete existing relations
-                await async_db(lambda: self.client.table("topic_relations").delete().eq(
-                    "project_id", project_id
-                ).execute())
+                # Wipe before LLM calls so we don't accumulate stale edges
+                await async_db(lambda:
+                    self.client.table("topic_relations")
+                    .delete()
+                    .eq("project_id", project_id)
+                    .execute()
+                )
 
-            # Process topics in batches to avoid token limits
-            all_edges = []
-            unique_topics = list(set(topics))  # Deduplicate
-
+            unique_topics = list(set(topics))
             logger.info(f"Building knowledge graph for {len(unique_topics)} topics")
 
+            all_edges: List[Dict] = []
+
             if len(unique_topics) <= self.BATCH_SIZE:
-                # Single batch
-                edges = await self._generate_relationships_for_batch(
-                    project_id, unique_topics, unique_topics
+                all_edges.extend(
+                    await self._generate_relationships_for_batch(
+                        project_id, unique_topics, unique_topics
+                    )
                 )
-                all_edges.extend(edges)
             else:
-                # Multiple batches with overlap for cross-batch relationships
                 batches = self._create_overlapping_batches(unique_topics)
                 logger.info(f"Processing {len(batches)} batches")
-
                 for i, batch in enumerate(batches):
                     logger.info(
                         f"Processing batch {i + 1}/{len(batches)} ({len(batch)} topics)"
                     )
-                    edges = await self._generate_relationships_for_batch(
-                        project_id, batch, unique_topics
+                    all_edges.extend(
+                        await self._generate_relationships_for_batch(
+                            project_id, batch, unique_topics
+                        )
                     )
-                    all_edges.extend(edges)
-
-                    # Small delay between batches to avoid rate limits
                     if i < len(batches) - 1:
                         await asyncio.sleep(0.5)
 
-            # Deduplicate edges
-            seen_edges = set()
-            unique_edges = []
+            # Deduplicate in-memory (cross-batch overlaps can produce the same edge)
+            seen: set = set()
+            unique_edges: List[Dict] = []
             for edge in all_edges:
                 key = (edge["from_topic"], edge["to_topic"])
-                if key not in seen_edges:
-                    seen_edges.add(key)
+                if key not in seen:
+                    seen.add(key)
                     unique_edges.append(edge)
 
             if unique_edges:
-                # Insert in chunks to avoid large payloads
+                # Use upsert so any remaining duplicates (e.g. from retries) are
+                # silently ignored instead of raising a 23505 constraint error.
                 for i in range(0, len(unique_edges), 100):
-                    chunk = unique_edges[i : i + 100]
-                    await async_db(lambda: self.client.table("topic_relations").insert(chunk).execute())
+                    chunk = unique_edges[i: i + 100]
+                    await async_db(lambda c=chunk: (
+                        self.client.table("topic_relations")
+                        .upsert(c, on_conflict="project_id,from_topic,to_topic")
+                        .execute()
+                    ))
 
                 logger.info(
-                    f"Created {len(unique_edges)} topic relationships for project {project_id}"
+                    f"Upserted {len(unique_edges)} topic relationships for {project_id}"
                 )
 
             return {
@@ -144,7 +177,6 @@ class KnowledgeGraph:
         except Exception as e:
             logger.error(f"Error building knowledge graph: {e}")
             import traceback
-
             logger.error(traceback.format_exc())
             return {"edges_created": 0, "message": f"Error: {str(e)}"}
 

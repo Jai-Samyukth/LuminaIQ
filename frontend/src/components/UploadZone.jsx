@@ -1,9 +1,17 @@
 import React, { useState, useCallback } from 'react';
-import { Upload, X, File, Check } from 'lucide-react';
+import { Upload, X, File, Check, Globe, Lock, ChevronDown, ChevronUp, Tag } from 'lucide-react';
 
 const UploadZone = ({ onFilesSelected, uploading }) => {
     const [selectedFiles, setSelectedFiles] = useState([]);
     const [isDragging, setIsDragging] = useState(false);
+
+    // Public/Private book options
+    const [isPublic, setIsPublic] = useState(false);
+    const [showBookMeta, setShowBookMeta] = useState(false);
+    const [bookTitle, setBookTitle] = useState('');
+    const [bookAuthor, setBookAuthor] = useState('');
+    const [bookDescription, setBookDescription] = useState('');
+    const [bookTagsInput, setBookTagsInput] = useState('');
 
     const handleDrop = useCallback((e) => {
         e.preventDefault();
@@ -19,8 +27,12 @@ const UploadZone = ({ onFilesSelected, uploading }) => {
 
         if (files.length > 0) {
             setSelectedFiles(files);
+            // Autofill title from first file name
+            if (!bookTitle) {
+                setBookTitle(files[0].name.replace(/\.[^.]+$/, ''));
+            }
         }
-    }, []);
+    }, [bookTitle]);
 
     const handleDragOver = useCallback((e) => {
         e.preventDefault();
@@ -38,6 +50,9 @@ const UploadZone = ({ onFilesSelected, uploading }) => {
         const files = Array.from(e.target.files);
         if (files.length > 0) {
             setSelectedFiles(files);
+            if (!bookTitle) {
+                setBookTitle(files[0].name.replace(/\.[^.]+$/, ''));
+            }
         }
     };
 
@@ -47,8 +62,20 @@ const UploadZone = ({ onFilesSelected, uploading }) => {
 
     const handleUpload = () => {
         if (selectedFiles.length > 0) {
-            onFilesSelected(selectedFiles);
+            const bookOptions = isPublic ? {
+                isPublic: true,
+                bookTitle: bookTitle || selectedFiles[0]?.name,
+                bookAuthor: bookAuthor || undefined,
+                bookDescription: bookDescription || undefined,
+                bookTags: bookTagsInput || undefined,
+            } : {};
+            onFilesSelected(selectedFiles, bookOptions);
         }
+    };
+
+    const togglePublic = () => {
+        setIsPublic(p => !p);
+        if (!isPublic) setShowBookMeta(true);
     };
 
     return (
@@ -59,8 +86,8 @@ const UploadZone = ({ onFilesSelected, uploading }) => {
                 onDragOver={handleDragOver}
                 onDragLeave={handleDragLeave}
                 className={`border-2 border-dashed rounded-xl p-12 text-center transition-colors ${isDragging
-                        ? 'border-[#C8A288] bg-[#FDF6F0]'
-                        : 'border-[#E6D5CC] hover:border-[#C8A288]'
+                    ? 'border-[#C8A288] bg-[#FDF6F0]'
+                    : 'border-[#E6D5CC] hover:border-[#C8A288]'
                     }`}
             >
                 <Upload className={`h-16 w-16 mx-auto mb-4 ${isDragging ? 'text-[#C8A288]' : 'text-[#8a6a5c]'}`} />
@@ -83,11 +110,11 @@ const UploadZone = ({ onFilesSelected, uploading }) => {
 
             {/* Selected Files List */}
             {selectedFiles.length > 0 && (
-                <div className="space-y-2">
+                <div className="space-y-3">
                     <h3 className="text-sm font-bold text-[#4A3B32]">
                         Selected Files ({selectedFiles.length})
                     </h3>
-                    <div className="max-h-48 overflow-y-auto space-y-2">
+                    <div className="max-h-40 overflow-y-auto space-y-2">
                         {selectedFiles.map((file, index) => (
                             <div
                                 key={index}
@@ -114,6 +141,109 @@ const UploadZone = ({ onFilesSelected, uploading }) => {
                         ))}
                     </div>
 
+                    {/* Public/Private Toggle */}
+                    <div className="rounded-xl border border-[#E6D5CC] overflow-hidden">
+                        <button
+                            type="button"
+                            onClick={togglePublic}
+                            className={`w-full flex items-center justify-between px-4 py-3 transition-colors ${isPublic
+                                ? 'bg-gradient-to-r from-[#C8A288]/20 to-[#B08B72]/10 border-b border-[#E6D5CC]'
+                                : 'bg-[#FDF6F0] hover:bg-[#F5EBE4]'
+                                }`}
+                        >
+                            <div className="flex items-center gap-3">
+                                {isPublic ? (
+                                    <div className="h-8 w-8 rounded-full bg-[#C8A288] flex items-center justify-center">
+                                        <Globe className="h-4 w-4 text-white" />
+                                    </div>
+                                ) : (
+                                    <div className="h-8 w-8 rounded-full bg-[#E6D5CC] flex items-center justify-center">
+                                        <Lock className="h-4 w-4 text-[#8a6a5c]" />
+                                    </div>
+                                )}
+                                <div className="text-left">
+                                    <p className="text-sm font-semibold text-[#4A3B32]">
+                                        {isPublic ? 'Public — Share in Book Store 🌐' : 'Private — Only for you 🔒'}
+                                    </p>
+                                    <p className="text-xs text-[#8a6a5c]">
+                                        {isPublic
+                                            ? 'This book will appear in the Book Store for all users'
+                                            : 'Only you can use this document in your projects'}
+                                    </p>
+                                </div>
+                            </div>
+                            <div className={`w-10 h-6 rounded-full transition-colors relative ${isPublic ? 'bg-[#C8A288]' : 'bg-[#E6D5CC]'}`}>
+                                <div className={`absolute top-1 w-4 h-4 bg-white rounded-full shadow transition-all ${isPublic ? 'left-5' : 'left-1'}`} />
+                            </div>
+                        </button>
+
+                        {/* Public book metadata fields */}
+                        {isPublic && (
+                            <div className="p-4 bg-white space-y-3">
+                                <button
+                                    type="button"
+                                    onClick={() => setShowBookMeta(p => !p)}
+                                    className="flex items-center gap-2 text-xs text-[#8a6a5c] hover:text-[#C8A288] transition-colors"
+                                >
+                                    {showBookMeta ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
+                                    {showBookMeta ? 'Hide book details' : 'Add book details (optional)'}
+                                </button>
+
+                                {showBookMeta && (
+                                    <div className="space-y-3 animate-in fade-in slide-in-from-top-1 duration-200">
+                                        <div>
+                                            <label className="block text-xs font-medium text-[#4A3B32] mb-1">
+                                                Book Title <span className="text-[#C8A288]">*</span>
+                                            </label>
+                                            <input
+                                                type="text"
+                                                value={bookTitle}
+                                                onChange={e => setBookTitle(e.target.value)}
+                                                placeholder="e.g., Introduction to Calculus"
+                                                className="w-full px-3 py-2 text-sm bg-[#FDF6F0] border border-[#E6D5CC] rounded-lg focus:ring-2 focus:ring-[#C8A288] outline-none"
+                                            />
+                                        </div>
+                                        <div>
+                                            <label className="block text-xs font-medium text-[#4A3B32] mb-1">Author</label>
+                                            <input
+                                                type="text"
+                                                value={bookAuthor}
+                                                onChange={e => setBookAuthor(e.target.value)}
+                                                placeholder="e.g., John Smith"
+                                                className="w-full px-3 py-2 text-sm bg-[#FDF6F0] border border-[#E6D5CC] rounded-lg focus:ring-2 focus:ring-[#C8A288] outline-none"
+                                            />
+                                        </div>
+                                        <div>
+                                            <label className="block text-xs font-medium text-[#4A3B32] mb-1">Description</label>
+                                            <textarea
+                                                value={bookDescription}
+                                                onChange={e => setBookDescription(e.target.value)}
+                                                placeholder="Brief description of this book..."
+                                                rows={3}
+                                                className="w-full px-3 py-2 text-sm bg-[#FDF6F0] border border-[#E6D5CC] rounded-lg focus:ring-2 focus:ring-[#C8A288] outline-none resize-none"
+                                            />
+                                        </div>
+                                        <div>
+                                            <label className="block text-xs font-medium text-[#4A3B32] mb-1">
+                                                Tags <span className="text-[#8a6a5c] font-normal">(comma-separated)</span>
+                                            </label>
+                                            <div className="relative">
+                                                <Tag className="absolute left-3 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-[#8a6a5c]" />
+                                                <input
+                                                    type="text"
+                                                    value={bookTagsInput}
+                                                    onChange={e => setBookTagsInput(e.target.value)}
+                                                    placeholder="e.g., physics, science, textbook"
+                                                    className="w-full pl-8 pr-3 py-2 text-sm bg-[#FDF6F0] border border-[#E6D5CC] rounded-lg focus:ring-2 focus:ring-[#C8A288] outline-none"
+                                                />
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+                        )}
+                    </div>
+
                     {/* Upload Button */}
                     <button
                         onClick={handleUpload}
@@ -128,7 +258,7 @@ const UploadZone = ({ onFilesSelected, uploading }) => {
                         ) : (
                             <>
                                 <Check className="h-5 w-5" />
-                                Upload {selectedFiles.length} File{selectedFiles.length !== 1 ? 's' : ''}
+                                {isPublic ? '🌐 Upload & Share' : `Upload ${selectedFiles.length} File${selectedFiles.length !== 1 ? 's' : ''}`}
                             </>
                         )}
                     </button>

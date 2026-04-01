@@ -37,7 +37,6 @@ import {
     Zap,
     PanelRight,
     Check,
-    CloudUpload,
     Eye,
     EyeOff,
     WifiOff
@@ -60,7 +59,6 @@ import {
     saveLearningProgress,
     generateMindmap,
     generateFlashcardsWithAI,
-    getDocumentUrl,
     subscribeDocumentProgress,
 } from '../api';
 import { useToast } from '../context/ToastContext';
@@ -94,6 +92,8 @@ import BookmarksPanel from '../components/BookmarksPanel';
 import GlobalSearch from '../components/GlobalSearch';
 import GamificationPanel from '../components/GamificationPanel';
 import { ProjectViewSkeleton } from '../components/Skeleton';
+import AddDocumentModal from '../components/AddDocumentModal';
+
 
 // Chat Agentic Components
 import { CommandPicker, CommandParamForm } from '../components/chat/ChatCommands';
@@ -170,6 +170,7 @@ const ProjectView = () => {
     const [showPomodoro, setShowPomodoro] = useState(false);
     const [showAITutor, setShowAITutor] = useState(false);
     const [showBookmarks, setShowBookmarks] = useState(false);
+    const [showAddDocModal, setShowAddDocModal] = useState(false);
     const [zenMode, setZenMode] = useState(false);
     const [tutorTopic, setTutorTopic] = useState(null);
     const [showProfileMenu, setShowProfileMenu] = useState(false);
@@ -753,13 +754,13 @@ const ProjectView = () => {
         }
     };
 
-    const handleFileUpload = async (files) => {
+    const handleFileUpload = async (files, bookOptions = {}) => {
         if (!files || files.length === 0) return;
         setUploading(true);
         try {
             // Upload files in parallel for better performance
             await Promise.all(
-                Array.from(files).map(file => uploadDocument(projectId, file))
+                Array.from(files).map(file => uploadDocument(projectId, file, null, bookOptions))
             );
             await fetchDocuments();
             setShowUploadModal(false);
@@ -1714,22 +1715,12 @@ const ProjectView = () => {
                         {/* Upload Section */}
                         <div className="shrink-0 px-4 pt-3 pb-2">
                             <button
-                                onClick={() => setShowRightSidebarUpload(!showRightSidebarUpload)}
-                                className={`w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-sm font-semibold transition-all ${showRightSidebarUpload
-                                    ? 'bg-[#E6D5CC] text-[#4A3B32] shadow-inner'
-                                    : 'bg-gradient-to-r from-[#C8A288] to-[#B08B72] text-white shadow-md hover:shadow-lg hover:scale-[1.02]'
-                                    }`}
+                                onClick={() => setShowAddDocModal(true)}
+                                className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-sm font-semibold bg-gradient-to-r from-[#C8A288] to-[#B08B72] text-white shadow-md hover:shadow-lg hover:scale-[1.01] transition-all"
                             >
-                                <CloudUpload className="h-4 w-4" />
-                                {showRightSidebarUpload ? 'Hide Upload' : 'Upload Documents'}
+                                <Plus className="h-4 w-4" />
+                                Add Document
                             </button>
-
-                            {/* Inline Upload Zone */}
-                            {showRightSidebarUpload && (
-                                <div className="mt-3 animate-in slide-in-from-top-2 duration-200">
-                                    <UploadZone onFilesSelected={handleFileUpload} uploading={uploading} />
-                                </div>
-                            )}
                         </div>
 
                         {/* Select All / Deselect All Controls */}
@@ -2049,7 +2040,24 @@ const ProjectView = () => {
                     setShowSearch(false);
                 }}
             />
+
+            {/* Add Document Modal — unified source picker (Book Store + Upload) */}
+            {showAddDocModal && (
+                <AddDocumentModal
+                    projectId={projectId}
+                    uploading={uploading}
+                    onUpload={async (files, bookOptions) => {
+                        await handleFileUpload(files, bookOptions);
+                        setShowAddDocModal(false);
+                    }}
+                    onImported={(doc) => {
+                        fetchDocuments();
+                    }}
+                    onClose={() => setShowAddDocModal(false)}
+                />
+            )}
         </div >
+
     );
 };
 

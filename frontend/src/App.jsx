@@ -9,6 +9,8 @@ import Login from './pages/Login';
 import Dashboard from './pages/Dashboard';
 import ProjectView from './pages/ProjectView';
 import Settings from './pages/Settings';
+import BookStore from './pages/BookStore';
+
 
 function App() {
     return (
@@ -25,6 +27,7 @@ function App() {
                                     <Route path="/dashboard" element={<Dashboard />} />
                                     <Route path="/project/:projectId" element={<ProjectView />} />
                                     <Route path="/settings" element={<Settings />} />
+                                    <Route path="/bookstore" element={<BookStore />} />
                                 </Route>
 
                                 <Route path="/" element={<Navigate to="/dashboard" replace />} />

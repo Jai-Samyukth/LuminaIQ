@@ -43,30 +43,53 @@ class SearchResult(BaseModel):
 async def upload_document(
     file: UploadFile = File(...),
     project_id: str = Form(...),
+    is_public: bool = Form(False),
+    book_title: Optional[str] = Form(None),
+    book_author: Optional[str] = Form(None),
+    book_description: Optional[str] = Form(None),
+    book_tags: Optional[str] = Form(None),  # comma-separated string from frontend
     current_user: dict = Depends(get_current_user),
 ):
     """
-    Upload a document and start processing directly.
+    Upload a document and start processing.
 
-    UNIFIED FLOW (no external pdfprocess service):
-    1. Validate file → 2. Save temp file → 3. Create DB record
-    4. Background: extract text → chunk → embed to Qdrant → topics → knowledge graph
-    5. Real-time SSE progress via /api/v1/progress/{document_id}
+    UNIFIED FLOW:
+    1. Validate file type & size
+    2. Save to temp file (memory efficient for large files)
+    3. Create document DB record
+    4. Background: extract text → save .txt to Supabase texts/ bucket → chunk → embed → topics → knowledge graph
+    5. If is_public=True: create a book record in the books table
+    6. Real-time SSE progress via /api/v1/progress/{document_id}
+
+    NOTE: Raw original files are NOT stored in Supabase Storage.
+    Only the extracted .txt is stored (10-50x smaller than PDFs).
     """
     temp_path = None
     try:
-        # 1. Validate File Type (MIME & Extension)
+        # 1. Validate File Type
         allowed_mimes = [
+            # Document formats
             "application/pdf",
             "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             "text/plain",
             "text/html",
             "text/markdown",
+            # Image formats — processed via Azure Computer Vision OCR
+            "image/jpeg",
+            "image/png",
+            "image/bmp",
+            "image/tiff",
+            "image/gif",
+            "image/webp",
+            # Some browsers send these for JPEG
+            "image/jpg",
+            "image/x-png",
         ]
         if file.content_type not in allowed_mimes:
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST,
-                "Invalid file type. Only PDF, DOCX, TXT, HTML, and MD are supported.",
+                "Invalid file type. Supported: PDF, DOCX, TXT, HTML, MD (documents) "
+                "and JPEG, PNG, BMP, TIFF, GIF, WebP (images — processed via OCR).",
             )
 
         file_ext = os.path.splitext(file.filename)[1].lower().replace(".", "")
@@ -109,6 +132,7 @@ async def upload_document(
             "file_type": file.content_type,
             "file_size": file_size,
             "upload_status": "pending",
+            "user_id": current_user.get("id"),
         }
 
         response = await async_db(
@@ -124,46 +148,34 @@ async def upload_document(
         document = response.data[0]
         document_id = document["id"]
 
-        # 3.5 Upload file to Supabase Storage for reading later
-        try:
-            storage_path = f"{project_id}/{document_id}_{file.filename}"
-            with open(temp_path, "rb") as f:
-                file_bytes = f.read()
+        # 4. Start CONCURRENT background processing
+        # asyncio.create_task = truly parallel (vs Starlette BackgroundTasks which are serial)
+        book_meta = None
+        if is_public:
+            book_meta = {
+                "title": book_title or file.filename,
+                "author": book_author,
+                "description": book_description,
+                "tags": [t.strip() for t in (book_tags or "").split(",") if t.strip()],
+                "file_size": file_size,
+                "file_type": file.content_type,
+                "user_id": current_user.get("id"),
+            }
 
-            def _upload_to_storage():
-                supabase = get_supabase_client()
-                supabase.storage.from_("documents").upload(
-                    file=file_bytes,
-                    path=storage_path,
-                    file_options={"content-type": file.content_type}
-                )
-
-            await async_db(_upload_to_storage)
-            logger.info(f"File {file.filename} uploaded to Supabase Storage as {storage_path}")
-            
-            # (Optional) generate URL and put it in response just in case
-            def _get_url():
-                return get_supabase_client().storage.from_("documents").get_public_url(storage_path)
-            document["file_url"] = await async_db(_get_url)
-            
-        except Exception as storage_err:
-            logger.error(f"Failed to upload {file.filename} to storage: {storage_err}")
-            # Non-fatal issue, allow the text pipeline to continue
-
-        # 4. Start CONCURRENT background processing (asyncio.create_task = truly parallel)
-        # This is the key fix: background_tasks.add_task() runs SERIALLY in Starlette,
-        # but asyncio.create_task() creates a truly concurrent coroutine.
         asyncio.create_task(
             document_service.process_document(
                 document_id=document_id,
                 project_id=project_id,
                 file_path=temp_path,
                 filename=file.filename,
+                user_id=current_user.get("id"),
+                book_meta=book_meta,
             )
         )
 
         logger.info(
-            f"Document {file.filename} upload started, processing in background"
+            f"Document {file.filename} upload started, processing in background "
+            f"(public={is_public})"
         )
 
         return document
@@ -214,49 +226,15 @@ async def delete_document(
         raise HTTPException(500, str(e))
 
 
-@router.get("/{document_id}/url")
-async def get_document_url(
-    document_id: str, project_id: str, current_user: dict = Depends(get_current_user)
-):
-    """Get a signed URL for reading the document PDF"""
-    try:
-        # First get the filename
-        res = await async_db(
-            lambda: document_service.client.table("documents")
-            .select("filename")
-            .eq("id", document_id)
-            .execute()
-        )
-        if not res.data:
-            raise HTTPException(404, "Document not found")
-            
-        filename = res.data[0]["filename"]
-        storage_path = f"{project_id}/{document_id}_{filename}"
-        
-        # Determine signed URL using service key
-        def _get_url():
-            return get_supabase_client().storage.from_("documents").create_signed_url(storage_path, 3600 * 24)
-            
-        signed_url_res = await async_db(_get_url)
-        
-        # Supabase Python SDK usually returns a dict like {'signedURL': '...'} or just a string
-        url = signed_url_res.get('signedURL') if isinstance(signed_url_res, dict) else signed_url_res
-        
-        return {"url": url}
-    except Exception as e:
-        logger.error(f"Failed to generate signed URL for {document_id}: {str(e)}")
-        raise HTTPException(500, f"Could not generate secure URL: {str(e)}")
-
-
 @router.get("/queue/status")
 async def get_queue_status(current_user: dict = Depends(get_current_user)):
     """
-    Get embedding queue status.
+    Get embedding queue status and current concurrency limits.
 
     Returns:
         - queued: Number of documents waiting
         - processing: Currently processing
-        - current_job: Filename being processed
+        - limits: Currently active concurrency limits
     """
     try:
         queue = get_embedding_queue()

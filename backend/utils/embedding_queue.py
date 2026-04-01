@@ -4,9 +4,11 @@ Parallel Embedding Processor with Global Concurrency Control
 Processes all documents in parallel BUT with shared resource limits.
 This prevents database timeouts when multiple PDFs are uploaded together.
 
+All limits are driven by config/settings.py — adjust there for easy tuning.
+
 Features:
 - Immediate processing (no queue delays)
-- Parallel document processing
+- Parallel document processing with configurable cap
 - GLOBAL concurrency limits prevent Qdrant timeouts
 - Progress tracking per document
 """
@@ -20,7 +22,7 @@ from utils.logger import logger
 
 
 class JobStatus(Enum):
-    PENDING = "pending"  # Just created, waiting for semaphore
+    PENDING = "pending"      # Just created, waiting for semaphore
     PROCESSING = "processing"
     COMPLETED = "completed"
     FAILED = "failed"
@@ -48,15 +50,37 @@ class EmbeddingJob:
     completed_batches: int = 0
 
 
+def _load_limits():
+    """
+    Load concurrency limits from settings at runtime so they can be changed
+    in settings.py without touching this file.
+    """
+    try:
+        from config.settings import settings
+        return {
+            "MAX_CONCURRENT_DOCUMENTS": settings.MAX_CONCURRENT_DOCUMENT_UPLOADS,
+            "MAX_GLOBAL_DB_OPERATIONS": settings.MAX_GLOBAL_DB_OPERATIONS,
+            "MAX_GLOBAL_EMBEDDINGS": settings.MAX_GLOBAL_EMBEDDINGS,
+            "MAX_CONCURRENT_LLM": settings.MAX_CONCURRENT_LLM,
+        }
+    except Exception:
+        # Fallback defaults if settings not yet available
+        return {
+            "MAX_CONCURRENT_DOCUMENTS": 10,
+            "MAX_GLOBAL_DB_OPERATIONS": 20,
+            "MAX_GLOBAL_EMBEDDINGS": 15,
+            "MAX_CONCURRENT_LLM": 5,
+        }
+
+
 class EmbeddingQueue:
     """
     Parallel Embedding Processor with Global Concurrency Control.
 
-    KEY FIX: Uses global semaphores to prevent overwhelming Qdrant
+    KEY DESIGN: Uses global semaphores to prevent overwhelming Qdrant
     when multiple documents are uploaded simultaneously.
 
-    Without limits: 3 PDFs x 20 concurrent batches = 60 parallel DB writes = TIMEOUT
-    With limits: 3 PDFs share 8 concurrent DB writes = SUCCESS
+    All limits are sourced from settings.py — change them there.
 
     Usage:
         queue = get_embedding_queue()
@@ -64,14 +88,10 @@ class EmbeddingQueue:
         status = queue.get_job_status(job_id)
     """
 
-    # Global limits - tuned for multi-user production load
-    # 3 docs process the heavy pipeline concurrently, rest wait in queue
-    MAX_CONCURRENT_DOCUMENTS = 3
-    MAX_GLOBAL_DB_OPERATIONS = 6   # Concurrent Qdrant writes (shared across all docs)
-    MAX_GLOBAL_EMBEDDINGS = 8      # Concurrent embedding API calls
-    MAX_CONCURRENT_LLM = 2         # Concurrent LLM calls (topics/graph generation)
+    # Lazily-loaded limits from settings
+    _limits: Optional[Dict] = None
 
-    # Singleton semaphores - created once, shared by all
+    # Singleton semaphores — created once per process, shared by all requests
     _doc_semaphore: Optional[asyncio.Semaphore] = None
     _db_semaphore: Optional[asyncio.Semaphore] = None
     _embed_semaphore: Optional[asyncio.Semaphore] = None
@@ -86,61 +106,83 @@ class EmbeddingQueue:
         # Auto-cleanup stale jobs from previous runs
         self.cleanup_old_jobs(max_age_hours=1)
 
+    @classmethod
+    def _get_limits(cls) -> Dict:
+        if cls._limits is None:
+            cls._limits = _load_limits()
+        return cls._limits
+
     def _ensure_semaphores(self):
-        """Create semaphores if not already created"""
+        """Create semaphores if not already created (process-singleton pattern)"""
+        limits = self._get_limits()
+
         if EmbeddingQueue._doc_semaphore is None:
             EmbeddingQueue._doc_semaphore = asyncio.Semaphore(
-                self.MAX_CONCURRENT_DOCUMENTS
+                limits["MAX_CONCURRENT_DOCUMENTS"]
             )
         if EmbeddingQueue._db_semaphore is None:
             EmbeddingQueue._db_semaphore = asyncio.Semaphore(
-                self.MAX_GLOBAL_DB_OPERATIONS
+                limits["MAX_GLOBAL_DB_OPERATIONS"]
             )
         if EmbeddingQueue._embed_semaphore is None:
             EmbeddingQueue._embed_semaphore = asyncio.Semaphore(
-                self.MAX_GLOBAL_EMBEDDINGS
+                limits["MAX_GLOBAL_EMBEDDINGS"]
             )
         if EmbeddingQueue._llm_semaphore is None:
             EmbeddingQueue._llm_semaphore = asyncio.Semaphore(
-                self.MAX_CONCURRENT_LLM
+                limits["MAX_CONCURRENT_LLM"]
             )
 
         logger.info(
-            f"[EmbeddingQueue] Limits: {self.MAX_CONCURRENT_DOCUMENTS} docs, "
-            f"{self.MAX_GLOBAL_DB_OPERATIONS} DB ops, {self.MAX_GLOBAL_EMBEDDINGS} embed, "
-            f"{self.MAX_CONCURRENT_LLM} LLM calls"
+            f"[EmbeddingQueue] Limits: "
+            f"{limits['MAX_CONCURRENT_DOCUMENTS']} docs, "
+            f"{limits['MAX_GLOBAL_DB_OPERATIONS']} DB ops, "
+            f"{limits['MAX_GLOBAL_EMBEDDINGS']} embed, "
+            f"{limits['MAX_CONCURRENT_LLM']} LLM calls"
         )
+
+    # ── Public semaphore accessors ────────────────────────────────────────────
 
     @classmethod
     def get_db_semaphore(cls) -> asyncio.Semaphore:
-        """Get the global DB operation semaphore for use in document_service"""
+        """Global DB operation semaphore (shared across all concurrent docs)"""
         if cls._db_semaphore is None:
-            cls._db_semaphore = asyncio.Semaphore(cls.MAX_GLOBAL_DB_OPERATIONS)
+            cls._db_semaphore = asyncio.Semaphore(
+                cls._get_limits()["MAX_GLOBAL_DB_OPERATIONS"]
+            )
         return cls._db_semaphore
 
     @classmethod
     def get_embed_semaphore(cls) -> asyncio.Semaphore:
-        """Get the global embedding semaphore for use in document_service"""
+        """Global embedding API semaphore"""
         if cls._embed_semaphore is None:
-            cls._embed_semaphore = asyncio.Semaphore(cls.MAX_GLOBAL_EMBEDDINGS)
+            cls._embed_semaphore = asyncio.Semaphore(
+                cls._get_limits()["MAX_GLOBAL_EMBEDDINGS"]
+            )
         return cls._embed_semaphore
 
     @classmethod
     def get_doc_semaphore(cls) -> asyncio.Semaphore:
-        """Get the global document concurrency semaphore"""
+        """Global document-level pipeline semaphore"""
         if cls._doc_semaphore is None:
-            cls._doc_semaphore = asyncio.Semaphore(cls.MAX_CONCURRENT_DOCUMENTS)
+            cls._doc_semaphore = asyncio.Semaphore(
+                cls._get_limits()["MAX_CONCURRENT_DOCUMENTS"]
+            )
         return cls._doc_semaphore
 
     @classmethod
     def get_llm_semaphore(cls) -> asyncio.Semaphore:
-        """Get the global LLM concurrency semaphore for topics/graph generation"""
+        """Global LLM semaphore (topics / knowledge graph generation)"""
         if cls._llm_semaphore is None:
-            cls._llm_semaphore = asyncio.Semaphore(cls.MAX_CONCURRENT_LLM)
+            cls._llm_semaphore = asyncio.Semaphore(
+                cls._get_limits()["MAX_CONCURRENT_LLM"]
+            )
         return cls._llm_semaphore
 
+    # ── Queue operations ───────────────────────────────────────────────────────
+
     async def start(self):
-        """No-op - processing starts immediately on enqueue"""
+        """No-op — processing starts immediately on enqueue"""
         pass
 
     async def stop(self):
@@ -164,14 +206,8 @@ class EmbeddingQueue:
         user_id: str = "",
     ) -> str:
         """
-        Add a document and start processing immediately.
-
-        Args:
-            document_id: The document ID
-            project_id: The project ID
-            filename: Document filename
-            chunks: List of text chunks to embed
-            process_callback: Async function to call for processing
+        Add a document and start processing immediately (non-blocking).
+        Processing is gated by the doc_semaphore — excess jobs wait their turn.
 
         Returns:
             job_id: Unique identifier for this job
@@ -211,7 +247,7 @@ class EmbeddingQueue:
     ):
         """Process a single job with document-level concurrency control"""
         try:
-            # Wait for document slot (limits concurrent docs)
+            # Wait for document slot (limits concurrent docs to MAX_CONCURRENT_DOCUMENT_UPLOADS)
             async with EmbeddingQueue._doc_semaphore:
                 job.status = JobStatus.PROCESSING
                 job.started_at = datetime.now()
@@ -242,12 +278,12 @@ class EmbeddingQueue:
             job.completed_at = datetime.now()
             logger.error(f"[EmbeddingQueue] Failed {job.filename}: {e}")
             import traceback
-
             logger.error(f"[EmbeddingQueue] Traceback: {traceback.format_exc()}")
 
         finally:
-            # Remove from active tasks
             self._active_tasks.pop(job.job_id, None)
+
+    # ── Status & stats ────────────────────────────────────────────────────────
 
     def get_job_status(self, job_id: str) -> Optional[Dict]:
         """Get status of a specific job"""
@@ -276,10 +312,9 @@ class EmbeddingQueue:
 
     def get_queue_stats(self) -> Dict:
         """Get overall queue statistics"""
+        limits = self._get_limits()
         pending = [j for j in self._jobs.values() if j.status == JobStatus.PENDING]
-        processing = [
-            j for j in self._jobs.values() if j.status == JobStatus.PROCESSING
-        ]
+        processing = [j for j in self._jobs.values() if j.status == JobStatus.PROCESSING]
         completed = [j for j in self._jobs.values() if j.status == JobStatus.COMPLETED]
         failed = [j for j in self._jobs.values() if j.status == JobStatus.FAILED]
 
@@ -290,6 +325,12 @@ class EmbeddingQueue:
             "failed": len(failed),
             "total": len(self._jobs),
             "active_tasks": len(self._active_tasks),
+            "limits": {
+                "max_concurrent_docs": limits["MAX_CONCURRENT_DOCUMENTS"],
+                "max_db_ops": limits["MAX_GLOBAL_DB_OPERATIONS"],
+                "max_embeddings": limits["MAX_GLOBAL_EMBEDDINGS"],
+                "max_llm": limits["MAX_CONCURRENT_LLM"],
+            },
             "current_jobs": [
                 {"filename": j.filename, "progress": j.progress} for j in processing
             ],
@@ -329,7 +370,7 @@ _embedding_queue: Optional[EmbeddingQueue] = None
 
 
 def get_embedding_queue() -> EmbeddingQueue:
-    """Get the global embedding queue"""
+    """Get the global embedding queue (process singleton)"""
     global _embedding_queue
     if _embedding_queue is None:
         _embedding_queue = EmbeddingQueue()

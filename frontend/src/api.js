@@ -87,36 +87,78 @@ export const getProjects = async () => {
     return response.data;
 };
 
-export const uploadDocument = async (projectId, file, onProgress) => {
+export const uploadDocument = async (projectId, file, onProgress, bookOptions = {}) => {
     const formData = new FormData();
     formData.append('file', file);
     formData.append('project_id', projectId);
 
+    // Book Store fields (only sent if user chose to share publicly)
+    if (bookOptions.isPublic) {
+        formData.append('is_public', 'true');
+        if (bookOptions.bookTitle) formData.append('book_title', bookOptions.bookTitle);
+        if (bookOptions.bookAuthor) formData.append('book_author', bookOptions.bookAuthor);
+        if (bookOptions.bookDescription) formData.append('book_description', bookOptions.bookDescription);
+        if (bookOptions.bookTags) formData.append('book_tags', bookOptions.bookTags);
+    }
+
+    const token = localStorage.getItem('token');
     const response = await axios.post(`${API_URL}/documents/upload`, formData, {
         headers: {
             'Content-Type': 'multipart/form-data',
-            // Forward auth token if it exists (axios interceptor might handle this, but good to be explicit if not using the instance)
-            ...api.defaults.headers.common
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
         },
         onUploadProgress: (progressEvent) => {
             if (onProgress) {
                 const percentCompleted = Math.round((progressEvent.loaded * 100) / progressEvent.total);
                 onProgress(percentCompleted);
             }
-        }
+        },
+        timeout: 120000, // 2 min for large files
     });
     return response.data;
 };
-
 export const getDocuments = async (projectId) => {
     const response = await api.get(`/documents/${projectId}`, { params: { _: Date.now() } });
     return response.data;
 };
 
-export const getDocumentUrl = async (projectId, documentId) => {
-    const response = await api.get(`/documents/${documentId}/url`, {
-        params: { project_id: projectId }
-    });
+// ============== Book Store API ==============
+
+export const getPublicBooks = async (page = 1, search = '', tags = null, pageSize = 20) => {
+    const params = { page, page_size: pageSize };
+    if (search) params.search = search;
+    if (tags && tags.length > 0) params.tags = tags.join(',');
+    const response = await api.get('/books/', { params });
+    return response.data;
+};
+
+export const getMyBooks = async () => {
+    const response = await api.get('/books/my');
+    return response.data;
+};
+
+export const getBook = async (bookId) => {
+    const response = await api.get(`/books/${bookId}`);
+    return response.data;
+};
+
+export const importBook = async (bookId, projectId) => {
+    const response = await api.post(`/books/${bookId}/import`, { project_id: projectId });
+    return response.data;
+};
+
+export const updateBook = async (bookId, updates) => {
+    const response = await api.patch(`/books/${bookId}`, updates);
+    return response.data;
+};
+
+export const deleteBook = async (bookId) => {
+    const response = await api.delete(`/books/${bookId}`);
+    return response.data;
+};
+
+export const getQueueStatus = async () => {
+    const response = await api.get('/documents/queue/status');
     return response.data;
 };
 
@@ -124,6 +166,7 @@ export const getChatHistory = async (projectId) => {
     const response = await api.get(`/chat/history/${projectId}`);
     return response.data;
 };
+
 
 export const chatMessage = async (projectId, message, history = []) => {
     const response = await api.post('/chat/message', {
